@@ -2,12 +2,16 @@
 
 Features used to exercise the collector:
 
-* two fixed columns (/tenders, /awards) with paginated lists and detail pages;
+* two fixed columns (/tenders, /awards) with paginated lists and per-column
+  detail pages (/tenders/notice/{code}, /awards/notice/{code});
+* one same-code/different-unit sample (see data.CONFLICT_CODE) so the
+  collector's cross-column verification table reports a 冲突 row;
 * a sliding-window rate limiter returning HTTP 429 with an integer
   Retry-After header, switchable at runtime via /admin;
 * an artificial latency switch;
-* one intentionally malformed detail page (see data.BROKEN_DETAIL_CODE) to
-  demonstrate parse-failure handling and the unfinished-page report.
+* one intentionally malformed tender-column detail page (see
+  data.BROKEN_DETAIL_CODE) to demonstrate parse-failure handling, the
+  unfinished-page report and the "one side failed -> 待核验" rule.
 """
 
 from __future__ import annotations
@@ -21,7 +25,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .data import ANNOUNCEMENTS, BROKEN_DETAIL_CODE, PAGE_SIZE, find_by_code, section_rows
+from .data import (
+    ANNOUNCEMENTS,
+    BROKEN_DETAIL_CODE,
+    CONFLICT_CODE,
+    PAGE_SIZE,
+    find_in_section,
+    section_rows,
+)
 
 DEFAULT_RATE_LIMIT = int(os.getenv("SITE_RATE_LIMIT", "12"))
 DEFAULT_WINDOW = float(os.getenv("SITE_RATE_WINDOW", "10"))
@@ -124,7 +135,7 @@ def _render_list(section: str, section_title: str, page: int) -> HTMLResponse:
     trs = "".join(
         f"""<tr class="announcement">
         <td class="code">{a.code}</td>
-        <td><a href="/notice/{a.code}">{a.title}</a></td>
+        <td><a href="/{section}s/notice/{a.code}">{a.title}</a></td>
         <td>{a.unit}</td><td>{a.deadline}</td></tr>"""
         for a in window_rows
     )
@@ -143,10 +154,17 @@ def _render_list(section: str, section_title: str, page: int) -> HTMLResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    body = """<h1>欢迎访问公共采购站（本地模拟）</h1>
-    <p>本站用于采集器联调，提供两个固定栏目：</p>
+    body = f"""<h1>欢迎访问公共采购站（本地模拟）</h1>
+    <p>本站用于采集器联调，提供两个固定栏目，详情页按栏目分开（同号两栏各有一份详情）：</p>
     <ul><li><a href="/tenders">招标公告（/tenders）</a></li>
     <li><a href="/awards">中标公告（/awards）</a></li></ul>
+    <p>联调样例：</p>
+    <ul>
+    <li>同号异单位：<a href="/tenders/notice/{CONFLICT_CODE}">招标栏 {CONFLICT_CODE}</a>
+        与 <a href="/awards/notice/{CONFLICT_CODE}">中标栏 {CONFLICT_CODE}</a> 的采购单位不同；</li>
+    <li>异常详情页：<a href="/tenders/notice/{BROKEN_DETAIL_CODE}">招标栏 {BROKEN_DETAIL_CODE}</a>
+        缺少必填字段（中标栏同号页面正常）。</li>
+    </ul>
     <p><a href="/admin">限流 / 延迟开关管理页</a></p>"""
     return HTMLResponse(_page_shell("首页", body))
 
@@ -161,14 +179,14 @@ async def awards(page: int = 1):
     return _render_list("award", "中标公告", page)
 
 
-@app.get("/notice/{code}", response_class=HTMLResponse)
-async def notice_detail(code: str):
-    item = find_by_code(code)
+def _render_notice(section: str, code: str) -> HTMLResponse:
+    item = find_in_section(section, code)
     if item is None:
         return HTMLResponse(_page_shell("未找到", "<h1>404 公告不存在</h1>"), status_code=404)
 
-    # Deliberately malformed page: missing procurement unit and deadline rows.
-    if code == BROKEN_DETAIL_CODE:
+    # Deliberately malformed page (tender column only): missing procurement
+    # unit and deadline rows. The award-column page for the same code is fine.
+    if section == "tender" and code == BROKEN_DETAIL_CODE:
         body = f"""<h1 id="detail-title">{item.title}</h1>
 <table class="detail-table">
 <tr><th>公告编号</th><td>{item.code}</td></tr>
@@ -177,7 +195,12 @@ async def notice_detail(code: str):
 <p class="notice">⚠ 测试用异常页：缺少“采购单位”和“截止日期”字段，采集器解析应失败。</p>"""
         return HTMLResponse(_page_shell("公告详情", body))
 
+    conflict_notice = ""
+    if code == CONFLICT_CODE:
+        conflict_notice = """<p class="notice">⚠ 同号异单位样例：该编号在另一栏目详情页中的采购单位与本页不同，
+采集器核验表应判为“冲突”。</p>"""
     body = f"""<h1 id="detail-title">{item.title}</h1>
+{conflict_notice}
 <table class="detail-table">
 <tr><th>公告编号</th><td>{item.code}</td></tr>
 <tr><th>采购单位</th><td>{item.unit}</td></tr>
@@ -186,6 +209,16 @@ async def notice_detail(code: str):
 </table>
 <p><a href="/{item.section}s">返回列表</a> ｜ 数据集总数：{len(ANNOUNCEMENTS)}</p>"""
     return HTMLResponse(_page_shell("公告详情", body))
+
+
+@app.get("/tenders/notice/{code}", response_class=HTMLResponse)
+async def tender_notice(code: str):
+    return _render_notice("tender", code)
+
+
+@app.get("/awards/notice/{code}", response_class=HTMLResponse)
+async def award_notice(code: str):
+    return _render_notice("award", code)
 
 
 # ------------------------------------------------------------------ admin API
@@ -209,8 +242,11 @@ async def admin_page():
 <form method="post" action="/admin/reset" style="margin-top:8px">
   <button type="submit" style="background:#475569">仅重置限流计数</button>
 </form>
-<p class="notice" style="margin-top:18px">异常详情页：<a href="/notice/{BROKEN_DETAIL_CODE}">
-/notice/{BROKEN_DETAIL_CODE}</a>（缺字段，用于验证采集器三次尝试后列入未完成页面）</p>"""
+<p class="notice" style="margin-top:18px">异常详情页：<a href="/tenders/notice/{BROKEN_DETAIL_CODE}">
+/tenders/notice/{BROKEN_DETAIL_CODE}</a>（招标栏缺字段，用于验证采集器三次尝试后列入未完成页面；
+中标栏同号页面正常，核验表应判“待核验”）<br/>
+同号异单位样例：<a href="/tenders/notice/{CONFLICT_CODE}">招标栏 {CONFLICT_CODE}</a> ／
+<a href="/awards/notice/{CONFLICT_CODE}">中标栏 {CONFLICT_CODE}</a>（两栏采购单位不同，核验表应判“冲突”）</p>"""
     return HTMLResponse(_page_shell("管理", body))
 
 

@@ -58,6 +58,18 @@ async def get_records() -> dict:
     }
 
 
+@app.get("/api/verification")
+async def get_verification() -> dict:
+    state = crawler.snapshot()
+    return {
+        "round_id": state["round_id"],
+        "status": state["status"],
+        "lists_complete": state["lists_complete"],
+        "counts": state["verification_counts"],
+        "rows": crawler.verification(),
+    }
+
+
 @app.get("/api/records/download")
 async def download_records():
     state = crawler.snapshot()
@@ -72,6 +84,13 @@ async def download_records():
         "records_count": len(crawler.records()),
         "unfinished_pages": state["unfinished"],
         "records": crawler.records(),
+        # Cross-column verification table for downstream filtering: records
+        # above stay deduplicated by code; filter/join on announcement_code.
+        "verification": {
+            "lists_complete": state["lists_complete"],
+            "counts": state["verification_counts"],
+            "rows": crawler.verification(),
+        },
     }
     headers = {
         "Content-Disposition": f'attachment; filename="procurement-{state["round_id"]}.json"'

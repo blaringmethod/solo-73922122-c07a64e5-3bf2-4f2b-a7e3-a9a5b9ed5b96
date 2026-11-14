@@ -16,6 +16,24 @@ Concurrency and rate-limit contract:
   requests and the connection pool, and only then flips the state to stopped
   and permits a new round. A round id guards against a late response from the
   old round being written into the new one.
+
+Cross-column verification contract:
+
+* The same announcement code can appear in both columns. Both columns' detail
+  pages are fetched (each column serves its own page), so a detail fetched
+  first can never mask a conflicting procurement unit on the other side.
+* The exported records stay deduplicated by announcement code (the tender
+  column wins when both sides succeed; a successful award side fills in when
+  the tender side fails). The verification table carries the per-side units
+  plus a conclusion for downstream filtering:
+  - ``match`` (一致): listed in both columns, both details fetched, same unit;
+  - ``conflict`` (冲突): listed in both columns, both details fetched, units
+    differ;
+  - ``single_column`` (单栏): seen in only one column's list AND both columns'
+    list pages were all collected;
+  - ``pending`` (待核验): anything else — a detail failed or was never sent
+    (stop), or list pages are missing/stopped so the other column's content
+    cannot be confirmed.
 """
 
 from __future__ import annotations
@@ -37,6 +55,18 @@ GATE_POLL_SECONDS = 0.25
 EVENT_LOG_LIMIT = 200
 DEFAULT_RETRY_AFTER_SECONDS = 5
 
+# Verification conclusions (stable keys for downstream filtering).
+CONCLUSION_MATCH = "match"
+CONCLUSION_CONFLICT = "conflict"
+CONCLUSION_SINGLE_COLUMN = "single_column"
+CONCLUSION_PENDING = "pending"
+CONCLUSION_LABELS = {
+    CONCLUSION_MATCH: "一致",
+    CONCLUSION_CONFLICT: "冲突",
+    CONCLUSION_SINGLE_COLUMN: "单栏",
+    CONCLUSION_PENDING: "待核验",
+}
+
 
 class RoundStopped(Exception):
     """Raised inside a round when cooperative stop has been requested."""
@@ -50,7 +80,7 @@ class SectionProgress:
     detail_enqueued: int = 0
     detail_completed: int = 0
     detail_failed: int = 0
-    duplicated_skipped: int = 0
+    duplicated_skipped: int = 0  # duplicate codes within one column's lists
 
 
 @dataclass
@@ -61,6 +91,18 @@ class UnfinishedPage:
     url: str
     reason: str
     attempts: int
+
+
+@dataclass
+class SideState:
+    """Verification state of one announcement code in one column."""
+
+    listed: bool = False  # the code appeared in this column's list pages
+    status: str = "pending"  # pending | ok | failed
+    unit: str | None = None
+    title: str | None = None
+    detail_url: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -76,6 +118,8 @@ class RoundState:
     pages_failed: int = 0
     records_count: int = 0
     cooldown_remaining_seconds: float = 0.0
+    lists_complete: bool = False
+    verification_counts: dict[str, int] = field(default_factory=dict)
     sections: dict[str, SectionProgress] = field(default_factory=dict)
     unfinished: list[UnfinishedPage] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
@@ -105,17 +149,43 @@ class Crawler:
             sections={name: SectionProgress() for name in sections},
         )
         self._records: dict[str, dict] = {}
-        self._seen_codes: set[str] = set()
+        # code -> section name -> per-column verification state
+        self._sides: dict[str, dict[str, SideState]] = {}
+        # (section, code) pairs already enqueued as detail jobs
+        self._enqueued_details: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------ state
     def snapshot(self) -> dict:
         now = time.monotonic()
         remaining = max(0.0, self._cooldown_until - now)
         self.state.cooldown_remaining_seconds = round(remaining, 1)
+        self.state.lists_complete = self._lists_complete()
+        counts = {key: 0 for key in CONCLUSION_LABELS}
+        for sides in self._sides.values():
+            counts[self._conclusion_for(sides, self.state.lists_complete)] += 1
+        self.state.verification_counts = counts
         return asdict(self.state)
 
     def records(self) -> list[dict]:
         return list(self._records.values())
+
+    def verification(self) -> list[dict]:
+        """Cross-column verification table, one row per announcement code."""
+        lists_complete = self._lists_complete()
+        rows = []
+        for code in sorted(self._sides):
+            sides = self._sides[code]
+            conclusion = self._conclusion_for(sides, lists_complete)
+            rows.append(
+                {
+                    "announcement_code": code,
+                    "conclusion": conclusion,
+                    "conclusion_label": CONCLUSION_LABELS[conclusion],
+                    "listed_in": [name for name in self.sections if sides[name].listed],
+                    "sides": {name: asdict(side) for name, side in sides.items()},
+                }
+            )
+        return rows
 
     def _log(self, message: str) -> None:
         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -134,7 +204,8 @@ class Crawler:
             self._inflight = asyncio.Semaphore(MAX_IN_FLIGHT)
             self._cooldown_until = 0.0
             self._records: dict[str, dict] = {}
-            self._seen_codes: set[str] = set()
+            self._sides: dict[str, dict[str, SideState]] = {}
+            self._enqueued_details: set[tuple[str, str]] = set()
 
             self.state = RoundState(
                 round_id=round_id,
@@ -253,9 +324,11 @@ class Crawler:
         else:
             self.state.status = "completed"
         self.state.records_count = len(self._records)
+        counts = self.snapshot()["verification_counts"]
         self._log(
             f"round ended: status={self.state.status}, "
-            f"records={self.state.records_count}, unfinished={len(self.state.unfinished)}"
+            f"records={self.state.records_count}, unfinished={len(self.state.unfinished)}, "
+            f"verification={counts}"
         )
 
     async def _worker(
@@ -322,10 +395,18 @@ class Crawler:
                 self.state.pages_enqueued += 1
 
         for item in result.items:
-            if item.code in self._seen_codes:
+            side = self._code_sides(item.code)[section]
+            if not side.listed:
+                side.listed = True
+                side.title = item.title
+            key = (section, item.code)
+            if key in self._enqueued_details:
+                # Same code twice within one column's lists: fetch once.
                 progress.duplicated_skipped += 1
                 continue
-            self._seen_codes.add(item.code)
+            self._enqueued_details.add(key)
+            # Both columns' detail pages are fetched for a shared code; the
+            # verification table compares the two sides afterwards.
             queue.put_nowait(
                 {
                     "section": section,
@@ -352,6 +433,10 @@ class Crawler:
         except Exception as exc:
             progress.detail_failed += 1
             self.state.pages_failed += 1
+            side = self._code_sides(job["page"])[section]
+            side.status = "failed"
+            side.error = str(exc)
+            side.detail_url = self._absolute(job["url"])
             self._mark_unfinished(job, str(exc), MAX_ATTEMPTS)
             self._log(f"[{section}] detail {job['page']} unfinished: {exc}")
             pending["count"] -= 1
@@ -359,15 +444,32 @@ class Crawler:
 
         progress.detail_completed += 1
         self.state.pages_completed += 1
-        self._records[detail["code"]] = {
-            "announcement_code": detail["code"],
-            "title": detail["title"],
-            "procurement_unit": detail["unit"],
-            "deadline": detail["deadline"],
-            "section": section,
-            "detail_url": self._absolute(job["url"]),
-        }
+
+        code = job["page"]
+        side = self._code_sides(code)[section]
+        side.status = "ok"
+        side.unit = detail["unit"]
+        side.title = detail["title"]
+        side.detail_url = self._absolute(job["url"])
+
+        # Records stay deduplicated by announcement code. When both columns
+        # provide a detail, the earlier column (招标公告) wins; a successful
+        # later column fills in when the earlier one failed. Conflicting
+        # units remain visible in the verification table.
+        existing = self._records.get(detail["code"])
+        if existing is None or self._section_rank(section) < self._section_rank(
+            existing["section"]
+        ):
+            self._records[detail["code"]] = {
+                "announcement_code": detail["code"],
+                "title": detail["title"],
+                "procurement_unit": detail["unit"],
+                "deadline": detail["deadline"],
+                "section": section,
+                "detail_url": self._absolute(job["url"]),
+            }
         self.state.records_count = len(self._records)
+        self._log_conflict_if_ready(code)
         pending["count"] -= 1
 
     # ------------------------------------------------------------- transport
@@ -458,7 +560,59 @@ class Crawler:
             return max(0, int(raw))
         return DEFAULT_RETRY_AFTER_SECONDS
 
+    # ------------------------------------------------------------ verification
+    def _code_sides(self, code: str) -> dict[str, SideState]:
+        sides = self._sides.get(code)
+        if sides is None:
+            sides = {name: SideState() for name in self.sections}
+            self._sides[code] = sides
+        return sides
+
+    def _lists_complete(self) -> bool:
+        """True only when every list page of every column was collected."""
+        if not self.state.sections:
+            return False
+        for progress in self.state.sections.values():
+            if progress.list_total_pages < 1:
+                return False
+            if progress.list_completed != progress.list_total_pages:
+                return False
+            if progress.list_failed:
+                return False
+        return True
+
+    @staticmethod
+    def _conclusion_for(sides: dict[str, SideState], lists_complete: bool) -> str:
+        listed = [name for name, side in sides.items() if side.listed]
+        if len(listed) >= 2:
+            # Both columns' details must succeed before units are compared.
+            if all(sides[name].status == "ok" for name in listed):
+                units = {sides[name].unit for name in listed}
+                return CONCLUSION_MATCH if len(units) == 1 else CONCLUSION_CONFLICT
+            return CONCLUSION_PENDING
+        # Seen in one column only: 单栏 is allowed only when both columns'
+        # lists are fully collected; otherwise the other column is unknown.
+        return CONCLUSION_SINGLE_COLUMN if lists_complete else CONCLUSION_PENDING
+
+    def _log_conflict_if_ready(self, code: str) -> None:
+        sides = self._sides.get(code)
+        if not sides:
+            return
+        listed = [name for name in self.sections if sides[name].listed]
+        if len(listed) < 2 or not all(sides[name].status == "ok" for name in listed):
+            return
+        units = {name: sides[name].unit for name in listed}
+        if len(set(units.values())) > 1:
+            detail = " / ".join(f"{name}={unit}" for name, unit in units.items())
+            self._log(f"⚠ 同号冲突 {code}: {detail}")
+
     # ---------------------------------------------------------------- helpers
+    def _section_rank(self, section: str) -> int:
+        try:
+            return list(self.sections).index(section)
+        except ValueError:  # pragma: no cover - defensive
+            return len(self.sections)
+
     def _list_url(self, section: str, page: int) -> str:
         path = self.sections[section]
         separator = "&" if "?" in path else "?"

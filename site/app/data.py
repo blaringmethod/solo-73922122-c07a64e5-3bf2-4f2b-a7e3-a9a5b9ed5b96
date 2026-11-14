@@ -4,9 +4,16 @@ import random
 from dataclasses import dataclass
 
 PAGE_SIZE = 6
-# This announcement's detail page is intentionally malformed so the crawler's
-# parse-failure / unfinished-page path can be demonstrated end to end.
+# This announcement's *tender-column* detail page is intentionally malformed so
+# the crawler's parse-failure / unfinished-page path can be demonstrated end to
+# end. The award-column page for the same code stays valid, which also
+# exercises the "one side failed -> 待核验" verification rule.
 BROKEN_DETAIL_CODE = "ZB-2026-010"
+# Same announcement number, different procurement unit across the two columns:
+# the award-column detail page below carries CONFLICT_AWARD_UNIT instead of the
+# tender-column unit, so the collector's verification table reports 冲突.
+CONFLICT_CODE = "ZB-2026-018"
+CONFLICT_AWARD_UNIT = "市卫生健康委员会"
 
 _UNITS = [
     "市教育局装备中心", "区城市管理局", "县人民医院", "省交通规划研究院",
@@ -46,14 +53,16 @@ def _build() -> dict[tuple[str, str], Announcement]:
         )
     # 24 award announcements reuse tender codes on purpose: the same
     # announcement number appears in both columns so the collector's
-    # code-based deduplication is exercised during a real run.
+    # code-based deduplication and cross-column verification are exercised
+    # during a real run. Each column serves its OWN detail page.
     for i in range(1, 25):
         code = f"ZB-2026-{i:03d}"
         original = data[("tender", code)]
+        unit = CONFLICT_AWARD_UNIT if code == CONFLICT_CODE else original.unit
         data[("award", code)] = Announcement(
             code=code,
             title=original.title.replace("（招标编号", "（中标公告，原招标编号"),
-            unit=original.unit,
+            unit=unit,
             deadline=original.deadline,
             section="award",
         )
@@ -67,9 +76,7 @@ def section_rows(section: str) -> list[Announcement]:
     return [a for key, a in ANNOUNCEMENTS.items() if key[0] == section]
 
 
-def find_by_code(code: str) -> Announcement | None:
-    # Detail pages are shared by code across the two columns.
-    for item in ANNOUNCEMENTS.values():
-        if item.code == code:
-            return item
-    return None
+def find_in_section(section: str, code: str) -> Announcement | None:
+    # Detail pages are per column: the same code can carry different content
+    # (in particular a different procurement unit) in each column.
+    return ANNOUNCEMENTS.get((section, code))
